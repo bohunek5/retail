@@ -1,5 +1,5 @@
 'use strict';
-const CONFIG = {"version":1,"build":"e3008107b1e28701cdd15121","salt":"apbQ7LJoSrmaXJeJofLz9gVseU1mA/kJi1Tw3gLdHZM=","iterations":600000,"manifest":"payload/18c956acf2d8b636a726047790d8e6399cf23bdbc52fbb7b877d141d491ba608.bin","scope":"/retail/"};
+const CONFIG = {"version":1,"build":"0e206af45e025ae7403fb0b0","salt":"pKaoAkNXZnkHmU0mohxXbHd64Fnjpl0DpmizXBEmYFQ=","iterations":600000,"manifest":"payload/a38889cde2b7ef0ae85a3094e7410550556a5aeefb0e693c3ce371aae67d15bf.bin","scope":"/retail/"};
 const PUBLIC = new Set(['gate.js','gate.css','preview-config.json','sw.js','robots.txt','.nojekyll','gate-logo.svg','gate-manrope.woff2']);
 const BASE = new URL(CONFIG.scope, self.location.origin);
 const encoder = new TextEncoder();
@@ -13,18 +13,40 @@ const noStore = {'Cache-Control':'no-store, private','X-Robots-Tag':'noindex, no
 self.addEventListener('install', event => event.waitUntil(self.skipWaiting()));
 self.addEventListener('activate', event => event.waitUntil(self.clients.claim()));
 
-async function decrypt(file, key) {
-  const response = await fetch(new URL(file, BASE), {cache:'no-store',credentials:'omit'});
-  if (!response.ok) throw new Error('network');
-  const sealed = new Uint8Array(await response.arrayBuffer());
-  return crypto.subtle.decrypt({name:'AES-GCM',iv:sealed.slice(0,12),additionalData:aad}, key, sealed.slice(12));
+async function decrypt(file, key, epoch = lockEpoch) {
+  // Retry only transport failures. Authentication/decryption runs once, below.
+  const delays = [250,750], transient = new Set([408,429,500,502,503,504]);
+  let sealed;
+  for (let attempt = 0; attempt <= delays.length; attempt += 1) {
+    if (epoch !== lockEpoch) throw new Error('locked');
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(),15000);
+    let retryable = true;
+    try {
+      const response = await fetch(new URL(file, BASE), {cache:'no-store',credentials:'omit',signal:controller.signal});
+      if (response.ok) sealed = new Uint8Array(await response.arrayBuffer());
+      else {
+        retryable = transient.has(response.status);
+        await response.body?.cancel().catch(() => {});
+      }
+    } catch { /* Network rejection, body interruption or timeout. */ }
+    finally { clearTimeout(timer); }
+    if (epoch !== lockEpoch) throw new Error('locked');
+    if (sealed) break;
+    if (!retryable || attempt === delays.length) throw new Error('network');
+    await new Promise(resolve => setTimeout(resolve,delays[attempt]));
+  }
+  const plain = await crypto.subtle.decrypt({name:'AES-GCM',iv:sealed.slice(0,12),additionalData:aad}, key, sealed.slice(12));
+  if (epoch !== lockEpoch) throw new Error('locked');
+  return plain;
 }
 async function openKey(raw) {
+  const epoch = lockEpoch;
   let key;
   try { key = await crypto.subtle.importKey('raw', decodeKey(raw), {name:'AES-GCM'}, false, ['decrypt']); }
   catch { throw new Error('password'); }
   let plain;
-  try { plain = await decrypt(CONFIG.manifest, key); }
+  try { plain = await decrypt(CONFIG.manifest, key, epoch); }
   catch (error) { throw new Error(error.message === 'network' ? 'network' : 'password'); }
   const manifest = JSON.parse(new TextDecoder().decode(plain));
   if (manifest.build !== CONFIG.build || !manifest.files?.['index.html']) throw new Error('password');
@@ -142,6 +164,7 @@ async function serve(event, path) {
   if (!entry) return new Response('Not found', {status:404,headers:noStore});
   try {
     const plain = await readFile(entry, active);
+    if (explicitlyLocked || active !== context) return new Response('Preview locked',{status:401,headers:noStore});
     const headers = {...noStore,'Content-Type':entry.mime,'Accept-Ranges':'bytes'};
     const range = event.request.headers.get('range');
     if (range) {
@@ -156,6 +179,7 @@ async function serve(event, path) {
     }
     return new Response(event.request.method === 'HEAD' ? null : plain,{headers:{...headers,'Content-Length':String(plain.byteLength)}});
   } catch {
+    if (explicitlyLocked || active !== context) return new Response('Preview locked',{status:401,headers:noStore});
     if (event.request.mode === 'navigate') return gate();
     if (event.clientId) (await self.clients.get(event.clientId))?.postMessage({type:'RETAIL_REFRESH_BUILD'});
     return new Response('Unable to load preview file. Refresh the page.',{status:503,headers:noStore});
